@@ -20,6 +20,8 @@ import datetime
 import pandas as pd
 import pytz
 
+from zipline.errors import NoFurtherDataError
+
 from .context_tricks import nop_context
 
 
@@ -68,29 +70,6 @@ def ensure_utc(time, tz='UTC'):
     if not time.tzinfo:
         time = time.replace(tzinfo=pytz.timezone(tz))
     return time.replace(tzinfo=pytz.utc)
-
-
-def _coerce_datetime(maybe_dt):
-    if isinstance(maybe_dt, datetime.datetime):
-        return maybe_dt
-    elif isinstance(maybe_dt, datetime.date):
-        return datetime.datetime(
-            year=maybe_dt.year,
-            month=maybe_dt.month,
-            day=maybe_dt.day,
-            tzinfo=pytz.utc,
-        )
-    elif isinstance(maybe_dt, (tuple, list)) and len(maybe_dt) == 3:
-        year, month, day = maybe_dt
-        return datetime.datetime(
-            year=year,
-            month=month,
-            day=day,
-            tzinfo=pytz.utc,
-        )
-    else:
-        raise TypeError('Cannot coerce %s into a datetime.datetime'
-                        % type(maybe_dt).__name__)
 
 
 def _out_of_range_error(a, b=None, var='offset'):
@@ -434,23 +413,28 @@ class TradingDayOfWeekRule(six.with_metaclass(ABCMeta, StatelessRule)):
         raise NotImplementedError
 
     def calculate_start_and_end(self, dt, env):
-        next_trading_day = _coerce_datetime(
-            env.add_trading_days(
-                self.td_delta,
-                self.date_func(dt, env),
-            )
-        )
+        while True:
+            new_date = self.date_func(dt, env)
+            if not new_date:
+                return
 
-        # If after applying the offset to the start/end day of the week, we get
-        # day in a different week, skip this week and go on to the next
-        while next_trading_day.isocalendar()[1] != dt.isocalendar()[1]:
-            dt += datetime.timedelta(days=7)
-            next_trading_day = _coerce_datetime(
-                env.add_trading_days(
+            try:
+                next_trading_day = env.add_trading_days(
                     self.td_delta,
-                    self.date_func(dt, env),
+                    new_date,
                 )
-            )
+            except NoFurtherDataError:
+                return
+
+            if not next_trading_day:
+                return
+
+            # If after applying the offset to the start/end day of the week, we
+            # get day in a different week, skip this week and go on to the next
+            if next_trading_day.isocalendar()[1] == dt.isocalendar()[1]:
+                break
+            else:
+                dt += datetime.timedelta(days=7)
 
         next_open, next_close = env.get_open_and_close(next_trading_day)
         self.next_date_start = next_open
@@ -493,18 +477,14 @@ class NthTradingDayOfWeek(TradingDayOfWeekRule):
         # trading day of the env is also the first trading day of the
         # week(in the TradingEnvironment, at least), so just return
         # that date.
-        if dt is None:
-            return prev
-        while dt.date().weekday() < prev.date().weekday():
+        while dt and dt.date().weekday() < prev.date().weekday():
             prev = dt
             dt = env.previous_trading_day(dt)
-            if dt is None:
-                return prev
 
         if env.is_trading_day(prev):
-            return prev.date()
+            return prev
         else:
-            return env.next_trading_day(prev).date()
+            return env.next_trading_day(prev)
 
     date_func = get_first_trading_day_of_week
 
@@ -522,19 +502,45 @@ class NDaysBeforeLastTradingDayOfWeek(TradingDayOfWeekRule):
         dt = env.next_trading_day(dt)
         # Traverse forward until we hit a week border, then jump back to the
         # previous trading day.
-        while dt.date().weekday() > prev.date().weekday():
+        while dt and dt.date().weekday() > prev.date().weekday():
             prev = dt
             dt = env.next_trading_day(dt)
 
         if env.is_trading_day(prev):
-            return prev.date()
+            return prev
         else:
-            return env.previous_trading_day(prev).date()
+            return env.previous_trading_day(prev)
 
     date_func = get_last_trading_day_of_week
 
 
-class NthTradingDayOfMonth(StatelessRule):
+class TradingDayOfMonthRule(six.with_metaclass(ABCMeta, StatelessRule)):
+
+    def should_trigger(self, dt, env):
+        return self.get_trigger_day_of_month(dt, env) == dt.date()
+
+    @abstractmethod
+    def date_func(self, dt, env):
+        raise NotImplementedError
+
+    def get_trigger_day_of_month(self, dt, env):
+        if self.month == dt.month:
+            # We already computed the day for this month.
+            return self.day
+
+        self.day = self.date_func(dt, env)
+        if self.td_delta and self.day:
+            try:
+                self.day = env.add_trading_days(self.td_delta, self.day)
+            except NoFurtherDataError:
+                self.day = None
+            if self.day:
+                self.day = self.day.date()
+
+        return self.day
+
+
+class NthTradingDayOfMonth(TradingDayOfMonthRule):
     """
     A rule that triggers on the nth trading day of the month.
     This is zero-indexed, n=0 is the first trading day of the month.
@@ -546,24 +552,6 @@ class NthTradingDayOfMonth(StatelessRule):
         self.month = None
         self.day = None
 
-    def should_trigger(self, dt, env):
-        return self.get_nth_trading_day_of_month(dt, env) == dt.date()
-
-    def get_nth_trading_day_of_month(self, dt, env):
-        if self.month == dt.month:
-            # We already computed the day for this month.
-            return self.day
-
-        if not self.td_delta:
-            self.day = self.get_first_trading_day_of_month(dt, env)
-        else:
-            self.day = env.add_trading_days(
-                self.td_delta,
-                self.get_first_trading_day_of_month(dt, env),
-            ).date()
-
-        return self.day
-
     def get_first_trading_day_of_month(self, dt, env):
         self.month = dt.month
 
@@ -572,8 +560,10 @@ class NthTradingDayOfMonth(StatelessRule):
                           else env.next_trading_day(dt)).date()
         return self.first_day
 
+    date_func = get_first_trading_day_of_month
 
-class NDaysBeforeLastTradingDayOfMonth(StatelessRule):
+
+class NDaysBeforeLastTradingDayOfMonth(TradingDayOfMonthRule):
     """
     A rule that triggers n days before the last trading day of the month.
     """
@@ -583,24 +573,6 @@ class NDaysBeforeLastTradingDayOfMonth(StatelessRule):
         self.td_delta = -n
         self.month = None
         self.day = None
-
-    def should_trigger(self, dt, env):
-        return self.get_nth_to_last_trading_day_of_month(dt, env) == dt.date()
-
-    def get_nth_to_last_trading_day_of_month(self, dt, env):
-        if self.month == dt.month:
-            # We already computed the last day for this month.
-            return self.day
-
-        if not self.td_delta:
-            self.day = self.get_last_trading_day_of_month(dt, env)
-        else:
-            self.day = env.add_trading_days(
-                self.td_delta,
-                self.get_last_trading_day_of_month(dt, env),
-            ).date()
-
-        return self.day
 
     def get_last_trading_day_of_month(self, dt, env):
         self.month = dt.month
@@ -618,6 +590,8 @@ class NDaysBeforeLastTradingDayOfMonth(StatelessRule):
             dt.replace(year=year, month=month, day=1)
         ).date()
         return self.last_day
+
+    date_func = get_last_trading_day_of_month
 
 
 # Stateful rules
