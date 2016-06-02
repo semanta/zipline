@@ -635,3 +635,10 @@ class NonExistentAssetInTimeFrame(ZiplineError):
         "The target asset '{asset}' does not exist for the entire timeframe "
         "between {start_date} and {end_date}."
     )
+
+
+class UnsupportedPipelineColumn(ZiplineError):
+    msg = (
+        "Adding single-column terms as pipeline columns is not currently "
+        "supported."
+    )
